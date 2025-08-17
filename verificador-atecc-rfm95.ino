@@ -3,8 +3,9 @@
   
   Descripción: 
   - Envía desafíos por LoRa al Probador
-  - Recibe firmas por LoRa
+  - Recibe firmas y datos GPS por LoRa
   - Verifica las firmas usando la clave pública del Probador
+  - Procesa y muestra datos de ubicación GPS
   
   Hardware:
   - Arduino + RFM95 + ATECC508A
@@ -38,6 +39,15 @@ ATECCX08A crypto;
 
 // Clave para la que se verificará la firma (slot 0).
 const uint8_t keyId_auth = 0;
+
+// Variables para datos GPS recibidos
+float receivedLatitude = 0.0;
+float receivedLongitude = 0.0;
+float receivedAltitude = 0.0;
+int receivedSatellites = 0;
+bool receivedGpsFix = false;
+String receivedGpsTime = "";
+String receivedGpsDate = "";
 
 // Aquí se guardará la clave pública de la Placa A.
 // Por favor, pega la clave pública real de la Placa A aquí.
@@ -76,6 +86,110 @@ bool verifySignature(byte* challengeBytes, int challengeLength, String signature
   }
   
   return false;
+}
+
+/**
+ * @brief Extrae un valor JSON de una cadena JSON simple
+ * @param jsonString La cadena JSON completa
+ * @param key La clave a buscar
+ * @return El valor de la clave como String
+ */
+String extractJSONValue(String jsonString, String key) {
+  String searchKey = "\"" + key + "\":";
+  int startPos = jsonString.indexOf(searchKey);
+  if (startPos == -1) return "";
+  
+  startPos += searchKey.length();
+  int endPos = jsonString.indexOf(",", startPos);
+  if (endPos == -1) {
+    endPos = jsonString.indexOf("}", startPos);
+  }
+  if (endPos == -1) return "";
+  
+  return jsonString.substring(startPos, endPos);
+}
+
+/**
+ * @brief Procesa los datos GPS recibidos en formato JSON
+ * @param gpsJsonString La cadena JSON con los datos GPS
+ */
+void processGPSData(String gpsJsonString) {
+  Serial.println("=== PROCESANDO DATOS GPS ===");
+  
+  // Extraer valores del JSON
+  String fixStr = extractJSONValue(gpsJsonString, "fix");
+  String latStr = extractJSONValue(gpsJsonString, "latitude");
+  String lonStr = extractJSONValue(gpsJsonString, "longitude");
+  String altStr = extractJSONValue(gpsJsonString, "altitude");
+  String satStr = extractJSONValue(gpsJsonString, "satellites");
+  String timeStr = extractJSONValue(gpsJsonString, "time");
+  String dateStr = extractJSONValue(gpsJsonString, "date");
+  
+  // Convertir y almacenar valores
+  receivedGpsFix = (fixStr == "true");
+  receivedLatitude = latStr.toFloat();
+  receivedLongitude = lonStr.toFloat();
+  receivedAltitude = altStr.toFloat();
+  receivedSatellites = satStr.toInt();
+  
+  // Limpiar comillas de tiempo y fecha
+  timeStr.replace("\"", "");
+  dateStr.replace("\"", "");
+  receivedGpsTime = timeStr;
+  receivedGpsDate = dateStr;
+  
+  // Mostrar datos procesados
+  if (receivedGpsFix) {
+    Serial.println("✅ SEÑAL GPS VÁLIDA");
+    Serial.print("📍 Ubicación: ");
+    Serial.print(receivedLatitude, 6);
+    Serial.print(", ");
+    Serial.println(receivedLongitude, 6);
+    Serial.print("📏 Altitud: ");
+    Serial.print(receivedAltitude);
+    Serial.println(" m");
+    Serial.print("🛰️ Satélites: ");
+    Serial.println(receivedSatellites);
+    Serial.print("🕐 Tiempo: ");
+    Serial.println(receivedGpsTime);
+    Serial.print("📅 Fecha: ");
+    Serial.println(receivedGpsDate);
+    
+    // Calcular distancia aproximada (ejemplo: desde coordenadas de referencia)
+    float refLat = 40.7128; // Nueva York como ejemplo
+    float refLon = -74.0060;
+    float distance = calculateDistance(receivedLatitude, receivedLongitude, refLat, refLon);
+    Serial.print("📊 Distancia desde referencia: ");
+    Serial.print(distance, 2);
+    Serial.println(" km");
+  } else {
+    Serial.println("❌ SIN SEÑAL GPS");
+    Serial.print("🛰️ Satélites visibles: ");
+    Serial.println(receivedSatellites);
+  }
+  Serial.println("=============================");
+}
+
+/**
+ * @brief Calcula la distancia entre dos puntos usando la fórmula de Haversine
+ * @param lat1 Latitud del punto 1
+ * @param lon1 Longitud del punto 1
+ * @param lat2 Latitud del punto 2
+ * @param lon2 Longitud del punto 2
+ * @return Distancia en kilómetros
+ */
+float calculateDistance(float lat1, float lon1, float lat2, float lon2) {
+  const float R = 6371; // Radio de la Tierra en km
+  
+  float dLat = radians(lat2 - lat1);
+  float dLon = radians(lon2 - lon1);
+  
+  float a = sin(dLat/2) * sin(dLat/2) +
+            cos(radians(lat1)) * cos(radians(lat2)) *
+            sin(dLon/2) * sin(dLon/2);
+  
+  float c = 2 * atan2(sqrt(a), sqrt(1-a));
+  return R * c;
 }
 
 void setup() {
@@ -121,7 +235,8 @@ void setup() {
   }
 
   Serial.println("Chip ATECC508A inicializado.");
-  Serial.println("Clave pública de la Placa A cargada. Esperando firmas...");
+  Serial.println("Clave pública de la Placa A cargada.");
+  Serial.println("Listo para verificar firmas y procesar datos GPS...");
 }
 
 void loop() {
@@ -167,12 +282,41 @@ void loop() {
         Serial.print("): ");
         Serial.println(response);
 
-        // Si la respuesta no está vacía, intentamos verificar la firma.
+        // Si la respuesta no está vacía, procesamos la firma y datos GPS
         if (response.length() > 0) {
-          if (verifySignature(challengeBytes, challengeLength, response)) {
-            Serial.println("VERIFICACIÓN EXITOSA: La firma es válida.");
+          // Separar firma y datos GPS
+          String signaturePart = "";
+          String gpsPart = "";
+          
+          if (response.indexOf("|GPS:") != -1) {
+            // La respuesta contiene datos GPS
+            int gpsIndex = response.indexOf("|GPS:");
+            signaturePart = response.substring(0, gpsIndex);
+            gpsPart = response.substring(gpsIndex + 5); // +5 para saltar "|GPS:"
+            
+            Serial.println("📡 Respuesta contiene datos GPS");
           } else {
-            Serial.println("VERIFICACIÓN FALLIDA: La firma no es válida.");
+            // Solo firma sin GPS
+            signaturePart = response;
+            Serial.println("📡 Respuesta solo contiene firma");
+          }
+          
+          // Extraer la firma (quitar "SIGNATURE:" si está presente)
+          String signatureHex = signaturePart;
+          if (signaturePart.startsWith("SIGNATURE:")) {
+            signatureHex = signaturePart.substring(10);
+          }
+          
+          // Verificar la firma
+          if (verifySignature(challengeBytes, challengeLength, signatureHex)) {
+            Serial.println("✅ VERIFICACIÓN EXITOSA: La firma es válida.");
+            
+            // Procesar datos GPS si están disponibles
+            if (gpsPart.length() > 0) {
+              processGPSData(gpsPart);
+            }
+          } else {
+            Serial.println("❌ VERIFICACIÓN FALLIDA: La firma no es válida.");
           }
         }
         responseReceived = true;
@@ -184,7 +328,21 @@ void loop() {
   }
   
   if (!responseReceived) {
-    Serial.println("Timeout: No se recibió respuesta de la Placa A");
+    Serial.println("⏰ Timeout: No se recibió respuesta de la Placa A");
+  } else {
+    // Mostrar resumen de la verificación
+    Serial.println("📋 RESUMEN DE VERIFICACIÓN:");
+    Serial.println("=============================");
+    if (receivedGpsFix) {
+      Serial.println("✅ Autenticación exitosa con datos GPS");
+      Serial.print("📍 Ubicación del dispositivo: ");
+      Serial.print(receivedLatitude, 6);
+      Serial.print(", ");
+      Serial.println(receivedLongitude, 6);
+    } else {
+      Serial.println("✅ Autenticación exitosa (sin datos GPS)");
+    }
+    Serial.println("=============================");
   }
   
   delay(5000); // Espera 5 segundos antes de enviar otro desafío.
